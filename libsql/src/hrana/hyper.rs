@@ -167,6 +167,15 @@ impl Conn for HttpConnection<HttpSender> {
         self.current_stream().execute_transactional_batch(sql).await
     }
 
+    async fn execute_batch_with_params(
+        &self,
+        statements: Vec<(String, Params)>,
+    ) -> crate::Result<BatchRows> {
+        self.current_stream()
+            .execute_batch_with_params(statements)
+            .await
+    }
+
     async fn prepare(&self, sql: &str) -> crate::Result<Statement> {
         let stream = self.current_stream().clone();
         let stmt = crate::hrana::Statement::new(stream, sql.to_string(), true).await?;
@@ -360,6 +369,47 @@ impl Conn for HranaStream<HttpSender> {
             .map(|r| r.map(StmtResultRows::new).map(Rows::new))
             .collect::<Vec<_>>();
 
+        Ok(BatchRows::new(rows))
+    }
+
+    async fn execute_batch_with_params(
+        &self,
+        statements: Vec<(String, Params)>,
+    ) -> crate::Result<BatchRows> {
+        let mut stmts = Vec::new();
+        let mut c = TxScopeCounter::default();
+        for (sql, params) in statements {
+            let kind = {
+                let mut parsed = crate::parser::Statement::parse(&sql);
+                match (parsed.next(), parsed.next()) {
+                    (Some(stmt), None) => stmt?.kind,
+                    _ => {
+                        return Err(Error::Misuse(
+                            "each statement of a batch must hold exactly one SQL statement"
+                                .to_string(),
+                        ))
+                    }
+                }
+            };
+            c.count(kind);
+            // Sent as written: the parser's rendering of a statement can differ
+            // from it, such as by dropping the comma between table options.
+            let mut stmt = Stmt::new(sql, true);
+            bind_params(params, &mut stmt);
+            stmts.push(stmt);
+        }
+        let in_tx_scope = !self.is_autocommit() || c.begin_tx();
+        let close = !in_tx_scope || c.end_tx();
+        let res = self
+            .batch_inner(Batch::from_iter(stmts), close)
+            .await
+            .map_err(|e| crate::Error::Hrana(e.into()))?;
+        unwrap_err(&res)?;
+        let rows = res
+            .step_results
+            .into_iter()
+            .map(|r| r.map(StmtResultRows::new).map(Rows::new))
+            .collect::<Vec<_>>();
         Ok(BatchRows::new(rows))
     }
 

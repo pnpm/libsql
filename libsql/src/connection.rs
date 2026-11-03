@@ -30,6 +30,15 @@ pub(crate) trait Conn {
 
     async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows>;
 
+    async fn execute_batch_with_params(
+        &self,
+        _statements: Vec<(String, Params)>,
+    ) -> Result<BatchRows> {
+        Err(crate::Error::Misuse(
+            "a batch of statements with parameters needs a remote connection".to_string(),
+        ))
+    }
+
     async fn prepare(&self, sql: &str) -> Result<Statement>;
 
     async fn transaction(&self, tx_behavior: TransactionBehavior) -> Result<Transaction>;
@@ -174,6 +183,44 @@ impl Connection {
     pub async fn execute_transactional_batch(&self, sql: &str) -> Result<BatchRows> {
         tracing::trace!("executing batch transactional `{}`", sql);
         self.conn.execute_transactional_batch(sql).await
+    }
+
+    /// Execute statements, each with its own parameters, as one batch, and
+    /// return the rows of each.
+    ///
+    /// A remote connection sends the batch in one request. Each statement
+    /// runs only when the one before it succeeded, and the first that fails
+    /// fails the call. Each statement is sent as written, and must hold
+    /// exactly one SQL statement. Only remote connections support this.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run(conn: &libsql::Connection) {
+    /// # use libsql::params;
+    /// let mut batch = conn
+    ///     .execute_batch_with_params([
+    ///         ("INSERT INTO foo (id) VALUES (?1)", params![42]),
+    ///         ("SELECT id FROM foo WHERE id = ?1", params![42]),
+    ///     ])
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
+    pub async fn execute_batch_with_params<S, P>(
+        &self,
+        statements: impl IntoIterator<Item = (S, P)>,
+    ) -> Result<BatchRows>
+    where
+        S: Into<String>,
+        P: IntoParams,
+    {
+        let statements = statements
+            .into_iter()
+            .map(|(sql, params)| Ok((sql.into(), params.into_params()?)))
+            .collect::<Result<Vec<_>>>()?;
+        tracing::trace!("executing a batch of {} statements", statements.len());
+        self.conn.execute_batch_with_params(statements).await
     }
 
     /// Execute sql query provided some type that implements [`IntoParams`] returning
